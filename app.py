@@ -2,15 +2,17 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import feedparser
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+from bs4 import BeautifulSoup
 import re
-from urllib.parse import urljoin, urlparse
-import logging
-from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import threading
 import time
+from collections import defaultdict
+import logging
 
-# Configure logging
+# Cấu hình logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(**name**)
@@ -18,272 +20,447 @@ logger = logging.getLogger(**name**)
 app = Flask(**name**)
 CORS(app)
 
+# Cấu hình múi giờ Việt Nam
+
+VN_TZ = pytz.timezone(‘Asia/Ho_Chi_Minh’)
+
 # RSS feeds configuration
 
 RSS_FEEDS = {
 ‘vietstock_stocks’: {
 ‘url’: ‘https://vietstock.vn/830/chung-khoan/co-phieu.rss’,
-‘name’: ‘VietStock - Cổ Phiếu’,
-‘category’: ‘stocks’
+‘category’: ‘Cổ phiếu’,
+‘source’: ‘VietStock’
 },
 ‘cafef_market’: {
 ‘url’: ‘https://cafef.vn/thi-truong-chung-khoan.rss’,
-‘name’: ‘CafeF - Thị Trường Chứng Khoán’,
-‘category’: ‘market’
+‘category’: ‘Thị trường’,
+‘source’: ‘CafeF’
 },
 ‘vietstock_expert’: {
 ‘url’: ‘https://vietstock.vn/145/chung-khoan/y-kien-chuyen-gia.rss’,
-‘name’: ‘VietStock - Ý Kiến Chuyên Gia’,
-‘category’: ‘expert’
+‘category’: ‘Ý kiến chuyên gia’,
+‘source’: ‘VietStock’
 },
 ‘vietstock_business’: {
 ‘url’: ‘https://vietstock.vn/737/doanh-nghiep/hoat-dong-kinh-doanh.rss’,
-‘name’: ‘VietStock - Hoạt Động Kinh Doanh’,
-‘category’: ‘business’
+‘category’: ‘Hoạt động kinh doanh’,
+‘source’: ‘VietStock’
 },
 ‘vietstock_dongduong’: {
 ‘url’: ‘https://vietstock.vn/1328/dong-duong/thi-truong-chung-khoan.rss’,
-‘name’: ‘VietStock - Đông Dương’,
-‘category’: ‘regional’
+‘category’: ‘Thị trường Đông Dương’,
+‘source’: ‘VietStock’
 }
 }
 
-# Cache configuration
+# Cache để lưu trữ tin tức
 
-CACHE_DURATION = 300  # 5 minutes
-cache = {}
+news_cache = defaultdict(list)
+last_update = None
+cache_duration = 300  # 5 phút
 
+class NewsProcessor:
+@staticmethod
 def clean_html(text):
-“”“Remove HTML tags and clean up text”””
+“”“Làm sạch HTML và định dạng text”””
 if not text:
 return “”
-# Remove HTML tags
-clean = re.compile(’<.*?>’)
-text = re.sub(clean, ‘’, text)
-# Clean up whitespace
-text = ’ ’.join(text.split())
-return text
-
-def parse_date(date_string):
-“”“Parse date string to ISO format”””
-try:
-if hasattr(date_string, ‘timetuple’):
-# feedparser struct_time
-dt = datetime(*date_string.timetuple()[:6])
-else:
-# Try to parse string
-dt = datetime.strptime(date_string, ‘%a, %d %b %Y %H:%M:%S %z’)
 
 ```
-    # Convert to Vietnam timezone
-    vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
-    if dt.tzinfo is None:
-        dt = vn_tz.localize(dt)
-    else:
-        dt = dt.astimezone(vn_tz)
+    # Parse HTML
+    soup = BeautifulSoup(text, 'html.parser')
     
-    return dt.isoformat()
-except Exception as e:
-    logger.warning(f"Error parsing date {date_string}: {e}")
-    return datetime.now(pytz.timezone('Asia/Ho_Chi_Minh')).isoformat()
+    # Loại bỏ các thẻ không cần thiết
+    for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
+        tag.decompose()
+    
+    # Lấy text sạch
+    clean_text = soup.get_text()
+    
+    # Làm sạch khoảng trắng
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    
+    return clean_text
+
+@staticmethod
+def extract_summary(description, max_length=200):
+    """Tạo tóm tắt từ mô tả"""
+    if not description:
+        return ""
+    
+    clean_desc = NewsProcessor.clean_html(description)
+    
+    # Tách câu
+    sentences = re.split(r'[.!?]+', clean_desc)
+    
+    summary = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence) > 10:  # Bỏ qua câu quá ngắn
+            if len(summary + sentence) < max_length:
+                summary += sentence + ". "
+            else:
+                break
+    
+    return summary.strip()
+
+@staticmethod
+def generate_id(title, link):
+    """Tạo ID duy nhất cho bài viết"""
+    content = f"{title}{link}"
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+@staticmethod
+def parse_date(date_str):
+    """Parse ngày tháng từ RSS"""
+    try:
+        if date_str:
+            # Thử parse theo format RFC 2822
+            parsed_date = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %z')
+            return parsed_date.astimezone(VN_TZ)
+    except:
+        pass
+    
+    # Nếu không parse được, dùng thời gian hiện tại
+    return datetime.now(VN_TZ)
 ```
 
 def fetch_rss_feed(feed_key, feed_config):
-“”“Fetch and parse a single RSS feed”””
+“”“Lấy dữ liệu từ một RSS feed”””
 try:
-logger.info(f”Fetching RSS feed: {feed_config[‘name’]}”)
+logger.info(f”Fetching {feed_key} from {feed_config[‘url’]}”)
 
 ```
-    # Set headers to mimic a browser
+    # Cấu hình headers để tránh bị block
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
-    # Fetch with requests first to handle headers
+    # Fetch RSS feed
     response = requests.get(feed_config['url'], headers=headers, timeout=10)
     response.raise_for_status()
     
-    # Parse with feedparser
+    # Parse RSS
     feed = feedparser.parse(response.content)
     
-    if feed.bozo:
-        logger.warning(f"Feed parsing warning for {feed_key}: {feed.bozo_exception}")
-    
     articles = []
-    for entry in feed.entries[:20]:  # Limit to 20 latest articles
+    for entry in feed.entries[:20]:  # Lấy tối đa 20 bài mới nhất
         try:
             article = {
-                'id': getattr(entry, 'id', entry.link),
-                'title': clean_html(getattr(entry, 'title', 'Không có tiêu đề')),
-                'link': getattr(entry, 'link', ''),
-                'description': clean_html(getattr(entry, 'description', getattr(entry, 'summary', ''))),
-                'published': parse_date(getattr(entry, 'published_parsed', getattr(entry, 'updated_parsed', datetime.now()))),
-                'source': feed_config['name'],
+                'id': NewsProcessor.generate_id(entry.title, entry.link),
+                'title': entry.title.strip(),
+                'link': entry.link,
+                'summary': NewsProcessor.extract_summary(
+                    entry.get('summary', '') or entry.get('description', '')
+                ),
+                'published': NewsProcessor.parse_date(
+                    entry.get('published', '')
+                ).isoformat(),
                 'category': feed_config['category'],
+                'source': feed_config['source'],
                 'feed_key': feed_key
             }
             
-            # Add image if available
+            # Thêm hình ảnh nếu có
             if hasattr(entry, 'media_content') and entry.media_content:
                 article['image'] = entry.media_content[0].get('url', '')
             elif hasattr(entry, 'enclosures') and entry.enclosures:
                 article['image'] = entry.enclosures[0].get('href', '')
             
             articles.append(article)
+            
         except Exception as e:
-            logger.error(f"Error processing entry in {feed_key}: {e}")
+            logger.error(f"Error processing entry from {feed_key}: {str(e)}")
             continue
     
-    logger.info(f"Successfully fetched {len(articles)} articles from {feed_config['name']}")
+    logger.info(f"Successfully fetched {len(articles)} articles from {feed_key}")
     return articles
     
 except Exception as e:
-    logger.error(f"Error fetching RSS feed {feed_key}: {e}")
+    logger.error(f"Error fetching {feed_key}: {str(e)}")
     return []
 ```
 
-def get_cached_news():
-“”“Get news from cache or fetch new data”””
-current_time = time.time()
+def update_news_cache():
+“”“Cập nhật cache tin tức”””
+global last_update
 
 ```
-# Check if cache is valid
-if 'data' in cache and 'timestamp' in cache:
-    if current_time - cache['timestamp'] < CACHE_DURATION:
-        logger.info("Returning cached news data")
-        return cache['data']
+logger.info("Starting news cache update...")
 
-logger.info("Cache expired or empty, fetching fresh news data")
-
-# Fetch all feeds concurrently
 all_articles = []
-with ThreadPoolExecutor(max_workers=5) as executor:
-    future_to_feed = {
-        executor.submit(fetch_rss_feed, feed_key, feed_config): feed_key 
-        for feed_key, feed_config in RSS_FEEDS.items()
-    }
-    
-    for future in future_to_feed:
-        try:
-            articles = future.result(timeout=15)
-            all_articles.extend(articles)
-        except Exception as e:
-            feed_key = future_to_feed[future]
-            logger.error(f"Error fetching {feed_key}: {e}")
+threads = []
 
-# Sort by published date (newest first)
+# Fetch tất cả feeds song song
+def fetch_feed(feed_key, feed_config):
+    articles = fetch_rss_feed(feed_key, feed_config)
+    all_articles.extend(articles)
+
+for feed_key, feed_config in RSS_FEEDS.items():
+    thread = threading.Thread(target=fetch_feed, args=(feed_key, feed_config))
+    threads.append(thread)
+    thread.start()
+
+# Đợi tất cả threads hoàn thành
+for thread in threads:
+    thread.join()
+
+# Sắp xếp theo thời gian mới nhất
 all_articles.sort(key=lambda x: x['published'], reverse=True)
 
-# Update cache
-cache['data'] = all_articles
-cache['timestamp'] = current_time
+# Cập nhật cache
+news_cache.clear()
+news_cache['all'] = all_articles
 
-logger.info(f"Fetched total {len(all_articles)} articles")
-return all_articles
+# Phân loại theo category
+for article in all_articles:
+    category = article['category']
+    if category not in news_cache:
+        news_cache[category] = []
+    news_cache[category].append(article)
+
+# Phân loại theo source
+for article in all_articles:
+    source = article['source']
+    source_key = f"source_{source.lower()}"
+    if source_key not in news_cache:
+        news_cache[source_key] = []
+    news_cache[source_key].append(article)
+
+last_update = datetime.now(VN_TZ)
+logger.info(f"Cache updated successfully with {len(all_articles)} articles")
 ```
+
+def should_update_cache():
+“”“Kiểm tra có cần cập nhật cache không”””
+if last_update is None:
+return True
+
+```
+time_since_update = datetime.now(VN_TZ) - last_update
+return time_since_update.total_seconds() > cache_duration
+```
+
+# API Routes
 
 @app.route(’/’)
 def home():
-“”“API documentation”””
+“”“Trang chủ API”””
 return jsonify({
-‘message’: ‘API Tin Tức Chứng Khoán Việt Nam’,
+‘message’: ‘Vietnamese Stock News API’,
 ‘version’: ‘1.0.0’,
 ‘endpoints’: {
-‘/api/news’: ‘Lấy tất cả tin tức’,
-‘/api/news?category=stocks’: ‘Lọc theo danh mục’,
-‘/api/news?source=vietstock_stocks’: ‘Lọc theo nguồn’,
-‘/api/news?limit=10’: ‘Giới hạn số lượng bài viết’,
-‘/api/sources’: ‘Danh sách các nguồn tin’
+‘all_news’: ‘/api/news’,
+‘by_category’: ‘/api/news/category/<category>’,
+‘by_source’: ‘/api/news/source/<source>’,
+‘search’: ‘/api/news/search?q=<query>’,
+‘latest’: ‘/api/news/latest/<count>’,
+‘stats’: ‘/api/stats’
 },
-‘categories’: [‘stocks’, ‘market’, ‘expert’, ‘business’, ‘regional’],
-‘sources’: list(RSS_FEEDS.keys())
+‘last_update’: last_update.isoformat() if last_update else None
 })
 
 @app.route(’/api/news’)
-def get_news():
-“”“Get news with optional filtering”””
-try:
-# Get query parameters
-category = request.args.get(‘category’, ‘’).lower()
-source = request.args.get(‘source’, ‘’).lower()
-limit = request.args.get(‘limit’, type=int)
+def get_all_news():
+“”“Lấy tất cả tin tức”””
+if should_update_cache():
+update_news_cache()
 
 ```
-    # Get all articles
-    articles = get_cached_news()
-    
-    # Apply filters
-    if category:
-        articles = [a for a in articles if a['category'] == category]
-    
-    if source:
-        articles = [a for a in articles if a['feed_key'] == source]
-    
-    # Apply limit
-    if limit and limit > 0:
-        articles = articles[:limit]
-    
-    return jsonify({
-        'success': True,
-        'total': len(articles),
-        'articles': articles,
-        'cached': 'data' in cache and time.time() - cache['timestamp'] < CACHE_DURATION,
-        'last_updated': datetime.fromtimestamp(cache.get('timestamp', time.time())).isoformat() if 'timestamp' in cache else None
-    })
-    
-except Exception as e:
-    logger.error(f"Error in get_news: {e}")
-    return jsonify({
-        'success': False,
-        'error': str(e),
-        'articles': []
-    }), 500
-```
+page = request.args.get('page', 1, type=int)
+per_page = request.args.get('per_page', 20, type=int)
 
-@app.route(’/api/sources’)
-def get_sources():
-“”“Get list of available news sources”””
-sources = []
-for key, config in RSS_FEEDS.items():
-sources.append({
-‘key’: key,
-‘name’: config[‘name’],
-‘category’: config[‘category’],
-‘url’: config[‘url’]
-})
+# Giới hạn per_page
+per_page = min(per_page, 100)
 
-```
+all_articles = news_cache.get('all', [])
+
+# Phân trang
+start = (page - 1) * per_page
+end = start + per_page
+articles = all_articles[start:end]
+
 return jsonify({
     'success': True,
-    'sources': sources
+    'data': articles,
+    'pagination': {
+        'page': page,
+        'per_page': per_page,
+        'total': len(all_articles),
+        'pages': (len(all_articles) + per_page - 1) // per_page
+    },
+    'last_update': last_update.isoformat() if last_update else None
 })
 ```
 
-@app.route(’/api/health’)
-def health_check():
-“”“Health check endpoint”””
+@app.route(’/api/news/category/<category>’)
+def get_news_by_category(category):
+“”“Lấy tin tức theo danh mục”””
+if should_update_cache():
+update_news_cache()
+
+```
+articles = news_cache.get(category, [])
+
 return jsonify({
-‘status’: ‘healthy’,
-‘timestamp’: datetime.now().isoformat(),
-‘cache_status’: ‘active’ if ‘data’ in cache else ‘empty’
+    'success': True,
+    'data': articles,
+    'category': category,
+    'count': len(articles),
+    'last_update': last_update.isoformat() if last_update else None
 })
+```
+
+@app.route(’/api/news/source/<source>’)
+def get_news_by_source(source):
+“”“Lấy tin tức theo nguồn”””
+if should_update_cache():
+update_news_cache()
+
+```
+source_key = f"source_{source.lower()}"
+articles = news_cache.get(source_key, [])
+
+return jsonify({
+    'success': True,
+    'data': articles,
+    'source': source,
+    'count': len(articles),
+    'last_update': last_update.isoformat() if last_update else None
+})
+```
+
+@app.route(’/api/news/search’)
+def search_news():
+“”“Tìm kiếm tin tức”””
+if should_update_cache():
+update_news_cache()
+
+```
+query = request.args.get('q', '').lower()
+if not query:
+    return jsonify({
+        'success': False,
+        'message': 'Query parameter is required'
+    }), 400
+
+all_articles = news_cache.get('all', [])
+
+# Tìm kiếm trong title và summary
+filtered_articles = [
+    article for article in all_articles
+    if query in article['title'].lower() or query in article['summary'].lower()
+]
+
+return jsonify({
+    'success': True,
+    'data': filtered_articles,
+    'query': query,
+    'count': len(filtered_articles),
+    'last_update': last_update.isoformat() if last_update else None
+})
+```
+
+@app.route(’/api/news/latest/<int:count>’)
+def get_latest_news(count):
+“”“Lấy tin tức mới nhất”””
+if should_update_cache():
+update_news_cache()
+
+```
+# Giới hạn count
+count = min(count, 50)
+
+all_articles = news_cache.get('all', [])
+latest_articles = all_articles[:count]
+
+return jsonify({
+    'success': True,
+    'data': latest_articles,
+    'count': len(latest_articles),
+    'last_update': last_update.isoformat() if last_update else None
+})
+```
+
+@app.route(’/api/stats’)
+def get_stats():
+“”“Thống kê API”””
+if should_update_cache():
+update_news_cache()
+
+```
+all_articles = news_cache.get('all', [])
+
+# Thống kê theo category
+category_stats = defaultdict(int)
+source_stats = defaultdict(int)
+
+for article in all_articles:
+    category_stats[article['category']] += 1
+    source_stats[article['source']] += 1
+
+return jsonify({
+    'success': True,
+    'stats': {
+        'total_articles': len(all_articles),
+        'by_category': dict(category_stats),
+        'by_source': dict(source_stats),
+        'last_update': last_update.isoformat() if last_update else None,
+        'cache_duration_seconds': cache_duration
+    }
+})
+```
+
+@app.route(’/api/refresh’)
+def refresh_cache():
+“”“Refresh cache thủ công”””
+update_news_cache()
+return jsonify({
+‘success’: True,
+‘message’: ‘Cache refreshed successfully’,
+‘last_update’: last_update.isoformat()
+})
+
+# Error handlers
 
 @app.errorhandler(404)
 def not_found(error):
 return jsonify({
 ‘success’: False,
-‘error’: ‘Endpoint not found’,
-‘message’: ‘Vui lòng kiểm tra lại URL API’
+‘message’: ‘Endpoint not found’
 }), 404
 
 @app.errorhandler(500)
 def internal_error(error):
 return jsonify({
 ‘success’: False,
-‘error’: ‘Internal server error’,
-‘message’: ‘Đã xảy ra lỗi server’
+‘message’: ‘Internal server error’
 }), 500
 
+# Background task để cập nhật cache định kỳ
+
+def background_updater():
+“”“Cập nhật cache trong background”””
+while True:
+try:
+if should_update_cache():
+update_news_cache()
+time.sleep(60)  # Kiểm tra mỗi phút
+except Exception as e:
+logger.error(f”Background update error: {str(e)}”)
+time.sleep(60)
+
 if **name** == ‘**main**’:
-port = int(os.environ.get(‘PORT’, 5000))
-app.run(host=‘0.0.0.0’, port=port, debug=False)
+# Khởi tạo cache lần đầu
+update_news_cache()
+
+```
+# Bắt đầu background updater
+updater_thread = threading.Thread(target=background_updater, daemon=True)
+updater_thread.start()
+
+# Chạy app
+port = int(os.environ.get('PORT', 5000))
+app.run(host='0.0.0.0', port=port, debug=False)
+```
