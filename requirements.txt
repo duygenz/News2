@@ -1,0 +1,6 @@
+Flask
+Flask-CORS
+feedparser
+requests
+pytz
+gunicorn
