@@ -1,6 +1,6 @@
-Flask
-Flask-CORS
-feedparser
-requests
-pytz
-gunicorn
+Flask==2.3.3
+Flask-CORS==4.0.0
+feedparser==6.0.10
+requests==2.31.0
+pytz==2023.3
+gunicorn==21.2.0
